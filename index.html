@@ -787,6 +787,151 @@ async function exportHighlights(view, media, button, tell) {
 
 'use strict';
 
+// MediaRecorder writes VP8 and Opus into a WebM segment. Keep encoded frames
+// and rebuild their cluster timestamps at the selected video keyframes.
+function readWebm(bytes) {
+  const SEGMENT=0x18538067, CLUSTER=0x1f43b675, INFO=0x1549a966, TRACKS=0x1654ae6b;
+  function vint(offset, raw=false) {
+    let marker=128, length=1;
+    while (marker && !(bytes[offset]&marker)) {marker >>= 1;length++;}
+    if (!marker || offset+length>bytes.length) throw Error('WebM innehåller en ogiltig elementlängd.');
+    let value=raw ? bytes[offset] : bytes[offset]&(marker-1);
+    let unknown=value===marker-1;
+    for (let i=1;i<length;i++) {
+      value=value*256+bytes[offset+i];
+      unknown=unknown && bytes[offset+i]===255;
+    }
+    return {value,length,unknown};
+  }
+  function element(offset, limit) {
+    const id=vint(offset,true);
+    const size=vint(offset+id.length);
+    const data=offset+id.length+size.length;
+    const end=size.unknown ? limit : data+size.value;
+    if (end>limit || end<data) throw Error('WebM-filen är ofullständig.');
+    return {id:id.value,start:offset,data,end,unknown:size.unknown};
+  }
+  function children(start,end) {
+    const items=[];
+    for(let offset=start;offset<end;) {
+      const entry=element(offset,end);
+      items.push(entry);offset=entry.end;
+    }
+    return items;
+  }
+  function number(e) {
+    let n=0;
+    for(let i=e.data;i<e.end;i++) n=n*256+bytes[i];
+    return n;
+  }
+  function packet(e,time,key) {
+    const track=vint(e.data);
+    const offset=e.data+track.length;
+    const delta=(bytes[offset]<<8)|bytes[offset+1];
+    const at=time+(delta&32768 ? delta-65536 : delta);
+    return {at,track:track.value,key:key ?? Boolean(bytes[offset+2]&128),flags:bytes[offset+2]&0x0e,head:bytes.subarray(e.data,offset),data:bytes.subarray(offset+3,e.end)};
+  }
+  const ebml=element(0,bytes.length);
+  const segment=element(ebml.end,bytes.length);
+  if (ebml.id!==0x1a45dfa3 || segment.id!==SEGMENT) throw Error('Videokodaren returnerade inte WebM.');
+  let tracks, info, videoTrack;
+  let scale=1000000;
+  const packets=[];
+  const upperLevel=new Set([CLUSTER,TRACKS,INFO,0x114d9b74,0x1c53bb6b,0x1254c367,0x1043a770,0x1941a469]);
+  for(let cursor=segment.data;cursor<segment.end;) {
+    const top=element(cursor,segment.end);
+    cursor=top.end;
+    if (top.id===INFO) {
+      info=children(top.data,top.end).filter(e=>[0x2ad7b1,0x4d80,0x5741].includes(e.id));
+      const timescale=info.find(e=>e.id===0x2ad7b1);
+      if (timescale) scale=number(timescale);
+    }
+    if (top.id===TRACKS) {
+      tracks=bytes.subarray(top.start,top.end);
+      for(const item of children(top.data,top.end).filter(e=>e.id===0xae)) {
+        const fields=children(item.data,item.end);
+        if (fields.some(e=>e.id===0x83 && number(e)===1)) videoTrack=number(fields.find(e=>e.id===0xd7));
+      }
+    }
+    if(top.id!==CLUSTER) continue;
+    let time=0;
+    for(let position=top.data;position<top.end;) {
+      const e=element(position,top.end);
+      if(top.unknown && upperLevel.has(e.id)) {cursor=position;break;}
+      position=e.end;
+      if(e.id===0xe7) time=number(e);
+      if(e.id===0xa3) packets.push(packet(e,time));
+      if(e.id===0xa0) {
+        const fields=children(e.data,e.end);
+        const block=fields.find(field=>field.id===0xa1);
+        if(block) packets.push(packet(block,time,!fields.some(field=>field.id===0xfb)));
+      }
+    }
+  }
+  if (!tracks || !videoTrack || !packets.length || !scale) throw Error('Ingen videoström kunde läsas från inspelningen.');
+  const videoKey=p=>p.key && p.track===videoTrack;
+  packets.sort((a,b)=>a.at-b.at || Number(videoKey(b))-Number(videoKey(a)));
+  const groups=[];
+  for(const p of packets) {
+    if(videoKey(p)) groups.push({start:p.at,packets:[]});
+    groups.at(-1)?.packets.push(p);
+  }
+  if(!groups.length) throw Error('Videon saknar startbilder för klippning.');
+  const step=40000000/scale;
+  groups.forEach((g,i)=>g.end=groups[i+1]?.start ?? (g.packets.at(-1).at+step));
+  return {header:bytes.subarray(0,ebml.end),tracks,info:(info||[]).map(e=>bytes.subarray(e.start,e.end)),groups,scale};
+}
+
+function cutWebm(source, windows) {
+  function integer(value,length) {
+    const bytes=[];
+    do {bytes.unshift(value%256);value=Math.floor(value/256);} while(value);
+    while(bytes.length<(length||1)) bytes.unshift(0);
+    return Uint8Array.from(bytes);
+  }
+  function size(value) {
+    let length=1;
+    while(value>=2**(7*length)-1) length++;
+    const bytes=integer(value,length);
+    bytes[0]|=1<<(8-length);
+    return bytes;
+  }
+  function item(id,parts) {
+    return [integer(id),size(parts.reduce((sum,p)=>sum+p.byteLength,0)),...parts];
+  }
+  const tick=1000000/source.scale;
+  const selected=source.groups.filter(g=>windows.some(([from,to])=>g.end>from*tick && g.start<to*tick));
+  if (!selected.length) return null;
+  let duration=0;
+  const clusters=[];
+  for(const g of selected) {
+    let origin=g.start;
+    let at=Math.round(duration);
+    let payload=item(0xe7,[integer(at)]);
+    for(const p of g.packets) {
+      if(p.at-origin>30000) {
+        clusters.push(new Blob(item(0x1f43b675,payload)));
+        at=Math.round(duration+p.at-g.start);
+        origin=p.at;
+        payload=item(0xe7,[integer(at)]);
+      }
+      const relative=p.at-origin;
+      const fields=Uint8Array.of((relative>>8)&255,relative&255,p.flags|(p.key?128:0));
+      payload.push(...item(0xa3,[p.head,fields,p.data]));
+    }
+    duration+=g.end-g.start;
+    clusters.push(new Blob(item(0x1f43b675,payload)));
+  }
+  const durationField=new Uint8Array(8);
+  new DataView(durationField.buffer).setFloat64(0,duration);
+  const info=item(0x1549a966,[...source.info,...item(0x4489,[durationField])]);
+  return new Blob([source.header,Uint8Array.of(0x18,0x53,0x80,0x67,0xff),...info,source.tracks,...clusters],{type:'video/webm'});
+}
+
+if (typeof module==='object' && module.exports) module.exports={readWebm,cutWebm};
+
+'use strict';
+
 function createStudio(media, message) {
   const camera = {};
   const recordings = [];
@@ -926,7 +1071,6 @@ function createStudio(media, message) {
       fill(String(team.score),x+181,529,'900 29px Bahnschrift, sans-serif','#fff',49);
     });
     if (recording()) {
-      updateClips();
       const seconds = Math.floor((now()-tape.started)/1000);
       monitor.textContent = '● SPELAR IN  '+String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');
     }
@@ -1000,15 +1144,14 @@ function createStudio(media, message) {
     source.start(t,kind==='cheer' ? 8.25 : 1.6,3.65);
   }
   function clip(ids, duration) {
-    const finish=now()+duration;
-    for (const id of ids) clips.set(id,Math.max(clips.get(id)||0,finish));
-  }
-  function updateClips() {
-    for (const entry of tape.entries) {
-      if (entry.id === null || entry.error) continue;
-      if ((clips.get(entry.id)||0)>now()) {
-        if (entry.recorder.state==='paused') entry.recorder.resume();
-      } else if (entry.recorder.state==='recording') entry.recorder.pause();
+    const elapsed=now()-tape.started;
+    for (const id of ids) {
+      const list=clips.get(id) || [];
+      const last=list.at(-1);
+      const start=Math.max(0,elapsed-900);
+      if (last && last[1]>=start) last[1]=Math.max(last[1],elapsed+duration);
+      else list.push([start,elapsed+duration]);
+      clips.set(id,list);
     }
   }
   function update(view) {
@@ -1039,7 +1182,6 @@ function createStudio(media, message) {
     if (audio && ['intro','reveal','podium','lock','transition'].includes(view.lastEvent)) {
       broadcastCue(audio,fx,categoryOpen ? 'stinger' : view.lastEvent);
     }
-    updateClips();
   }
   async function listDevices() {
     if (!navigator.mediaDevices?.enumerateDevices) throw Error('Aktivera produktionen över HTTPS eller i Edge på samma dator.');
@@ -1072,13 +1214,13 @@ function createStudio(media, message) {
       await listDevices();
     } catch (error) { stream.getTracks().forEach(track=>track.stop()); throw error; }
   }
-  function makeRecord(id, stream, mime, bitrate) {
-    const recorder = new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:bitrate,audioBitsPerSecond:96000});
-    const entry={id,recorder,chunks:[],error:null};
+  function makeRecord(stream, mime) {
+    const recorder = new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:2750000,audioBitsPerSecond:96000,videoKeyFrameIntervalDuration:950});
+    const entry={recorder,chunks:[],error:null};
     entry.done=new Promise(resolve=>{
       recorder.ondataavailable=e=>{if(e.data.size) entry.chunks.push(e.data);};
       recorder.onstop=()=>resolve();
-      recorder.onerror=event=>{entry.error=event.error || Error('Kodningen avbröts'); if (id===null && recording()) stop().catch(report); resolve();};
+      recorder.onerror=event=>{entry.error=event.error || Error('Kodningen avbröts'); if (recording()) stop().catch(report); resolve();};
     });
     return entry;
   }
@@ -1089,25 +1231,24 @@ function createStudio(media, message) {
     await prepareAudio();
     if (camera.A?.stream.getAudioTracks().length && !mic) mic=audio.createMediaStreamSource(camera.A.stream);
     if (mic) { mic.disconnect();mic.connect(mix); }
-    const formats=['video/webm;codecs=vp8,opus','video/mp4;codecs=avc1,mp4a.40.2','video/webm'];
+    const formats=['video/webm;codecs=vp8,opus','video/webm'];
     const mime=formats.find(format=>MediaRecorder.isTypeSupported(format));
-    if (!mime) throw Error('Webbläsaren har ingen kompatibel videokodare.');
+    if (!mime) throw Error('Använd Edge eller Chrome med WebM-stöd för att klippa lagfilmerna.');
     const videoStream=canvas.captureStream(24);
     const tracks=[...videoStream.getVideoTracks(),...mix.stream.getAudioTracks()];
     const stream=new MediaStream(tracks);
-    const entries=[];
+    let entry;
     clips.clear();
     recordings.splice(0).forEach(item=>URL.revokeObjectURL(item.url));
     try {
-      entries.push(makeRecord(null,stream,mime,3000000));
-      teams().forEach(t=>entries.push(makeRecord(t.id,stream,mime,1850000)));
-      entries.forEach(item=>item.recorder.start(1000));
+      entry=makeRecord(stream,mime);
+      entry.recorder.start(1000);
     } catch (error) {
-      entries.forEach(item=>{if (item.recorder.state!=='inactive') item.recorder.stop();});
+      if (entry && entry.recorder.state!=='inactive') entry.recorder.stop();
       videoStream.getTracks().forEach(track=>track.stop());
       throw error;
     }
-    tape={entries,videoStream,mime,started:now(),mode:'recording'};
+    tape={entry,videoStream,mime,started:now(),mode:'recording'};
     clip(teams().map(t=>t.id),5500);
     angle='A';
     pulseIndex=0;
@@ -1123,22 +1264,38 @@ function createStudio(media, message) {
     clearTimeout(autoStop);
     clearInterval(questionPulse);
     refreshPanel();
-    active.entries.forEach(entry=>{if (entry.recorder.state!=='inactive') entry.recorder.stop();});
-    await Promise.all(active.entries.map(entry=>entry.done));
+    const {entry}=active;
+    if (entry.recorder.state!=='inactive') entry.recorder.stop();
+    await entry.done;
     active.videoStream.getTracks().forEach(track=>track.stop());
     mic?.disconnect();
-    for (const entry of active.entries) {
-      if (entry.error || !entry.chunks.length) continue;
-      const team=teams().find(t=>t.id===entry.id);
-      const extension=active.mime.startsWith('video/mp4') ? '.mp4' : '.webm';
-      const name=team ? 'Lag '+team.id+' – '+team.name : 'Hela programmet';
-      const safe=name.replace(/[\\/:*?"<>|\u0000-\u001f]/g,'-');
-      const blob=new Blob(entry.chunks,{type:entry.recorder.mimeType || active.mime});
-      recordings.push({name,url:URL.createObjectURL(blob),file:'Destination Game Night – '+safe+extension});
+    try {
+      if (!entry.chunks.length) throw entry.error || Error('Inspelningen hann inte skapa någon fil.');
+      const program=new Blob(entry.chunks,{type:entry.recorder.mimeType || active.mime});
+      function addFile(name,blob) {
+        const safe=name.replace(/[\\/:*?"<>|\u0000-\u001f]/g,'-');
+        recordings.push({name,url:URL.createObjectURL(blob),file:'Destination Game Night – '+safe+'.webm'});
+      }
+      addFile('Hela programmet',program);
+      const source=readWebm(new Uint8Array(await program.arrayBuffer()));
+      // Rewrite duration and timestamps for the master as well, so the
+      // resulting file has a duration in ordinary browser video players.
+      const master=cutWebm(source,[[0,Infinity]]);
+      if (master) {
+        URL.revokeObjectURL(recordings[0].url);
+        recordings[0].url=URL.createObjectURL(master);
+      }
+      for (const team of teams()) {
+        const reel=cutWebm(source,clips.get(team.id)||[]);
+        if (reel) addFile('Lag '+team.id+' – '+team.name,reel);
+      }
+      if (entry.error) message('Kodaren avbröt inspelningen. Filerna innehåller det som hann spelas in.');
+    } catch (error) {
+      message(recordings.length ? 'Lagfilmerna kunde inte klippas. Hela inspelningen går att hämta. '+error.message : error.message);
+    } finally {
+      tape=null;
+      refreshPanel();
     }
-    tape=null;
-    refreshPanel();
-    if (recordings.length!==active.entries.length) message('En eller flera videofiler kunde inte kodas. Spara de filer som visas.');
   }
   function refreshPanel() {
     if (!panel) return;
@@ -1189,7 +1346,7 @@ function createStudio(media, message) {
         if (!action || working) return;
         try {
           if (action==='applause' || action==='cheer') { await sound(action);return; }
-          if (action==='mark') { if (recording()) {clip(teams().map(t=>t.id),5000);updateClips();} else message('Starta inspelningen för att markera ett klipp.');return; }
+          if (action==='mark') { if (recording()) clip(teams().map(t=>t.id),5000); else message('Starta inspelningen för att markera ett klipp.');return; }
           working=true;
           refreshPanel();
           if (action==='scan') await listDevices();
