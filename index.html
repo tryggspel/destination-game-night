@@ -1072,7 +1072,10 @@ function createStudio(media, message) {
     });
     if (recording()) {
       const seconds = Math.floor((now()-tape.started)/1000);
-      monitor.textContent = '● SPELAR IN  '+String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');
+      if (seconds !== tape.second) {
+        tape.second=seconds;
+        monitor.textContent = '● SPELAR IN  '+String(Math.floor(seconds/60)).padStart(2,'0')+':'+String(seconds%60).padStart(2,'0');
+      }
     }
   }
   function videoFor(url) {
@@ -1257,6 +1260,13 @@ function createStudio(media, message) {
     },2200);
     frame();
   }
+  async function testExport() {
+    if (Object.values(camera).some(input=>!input.test)) throw Error('Koppla från de riktiga kamerorna innan du använder testsignalerna.');
+    await connectTest();
+    await start();
+    clearTimeout(autoStop);
+    autoStop=setTimeout(()=>stop().catch(report),5250);
+  }
   async function stop() {
     if (!recording()) return;
     const active=tape;
@@ -1325,7 +1335,7 @@ function createStudio(media, message) {
         <div class="producer-input"><label>Kamerakälla <select data-device data-setup aria-label="Kamerakälla"><option value="">Standardkamera</option></select></label><button data-prod="scan" data-setup>Sök kameror</button><button data-prod="connect-a" data-setup>Anslut A</button><button data-prod="connect-b" data-setup>Anslut B</button><button data-prod="test-cameras" data-setup>Prova utan kameror</button><button data-prod="disconnect" data-setup>Koppla från</button></div>
         <div class="producer-input"><span data-inputs></span><label><input type="checkbox" data-microphone data-setup checked> Spela in standardmikrofonen</label>
         <label>Programbild <select data-layout><option value="auto">Automatisk klippning</option><option value="A">Kamera A</option><option value="B">Kamera B</option><option value="split">Delad bild</option></select></label></div>
-        <div class="producer-input"><button class="record-start" data-prod="start">● Starta inspelning</button><button data-prod="stop">■ Stoppa & spara</button><button data-prod="mark">Markera höjdpunkt</button></div>
+        <div class="producer-input"><button class="record-start" data-prod="start">● Starta inspelning</button><button data-prod="stop">■ Stoppa & spara</button><button data-prod="mark">Markera höjdpunkt</button><button data-prod="test-export" data-setup>Testa export (5 sek)</button></div>
         <div class="producer-input"><button data-prod="applause">Applåder</button><button data-prod="cheer">Jubel</button><label><input type="checkbox" data-speakers checked> Effektljud i lokalen</label></div>
         <div class="producer-files" data-files aria-label="Färdiga videofiler"></div><p>Öppna TV-fönstret för gästerna. Kör inspelningen från kontrollrummet och håll fliken öppen tills filerna är klara.</p>`;
       canvas=panel.querySelector('canvas');
@@ -1353,6 +1363,7 @@ function createStudio(media, message) {
           if (action==='connect-a' || action==='connect-b') await connect(action.slice(-1).toUpperCase());
           if (action==='test-cameras') await connectTest();
           if (action==='start') await start();
+          if (action==='test-export') await testExport();
           if (action==='stop') await stop();
           if (action==='disconnect') {
             for (const input of ['A','B']) disconnectInput(input);
@@ -1363,7 +1374,7 @@ function createStudio(media, message) {
       });
       updateFilm();
       frame();
-      previewTimer=setInterval(frame,1000/24);
+      previewTimer=setInterval(()=>{if (recording() || camera.A || camera.B || openingFilm) frame();},1000/24);
       window.addEventListener('pagehide',()=>{
         clearInterval(previewTimer);clearInterval(questionPulse);
         for (const input of ['A','B']) disconnectInput(input);
